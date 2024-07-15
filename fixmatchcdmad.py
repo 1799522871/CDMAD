@@ -19,8 +19,13 @@ import torchvision.transforms as transforms
 import torch.nn.functional as F
 from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
 from scipy import optimize
+import logging
+from pathlib import Path
+from torch.utils.tensorboard import SummaryWriter
 
-parser = argparse.ArgumentParser(description='PyTorch fixMatch Training')
+
+
+parser = argparse.ArgumentParser(description='PyTorch fixMatc[h Training')
 # Optimization options
 parser.add_argument('--epochs', default=500, type=int, metavar='N',
                     help='number of total epochs to run')  #默认500轮
@@ -100,11 +105,32 @@ torch.manual_seed(args.manualSeed)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
+# 创建日志文件目录
+log_dir = Path(args.out)
+log_dir.mkdir(exist_ok=True)
+
+out_log = 'result.log'
+# 配置日志记录器
+logging.basicConfig(
+    filename=str(log_dir / out_log),
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+# 获取日志记录器实例
+logger = logging.getLogger(__name__)
+
+print(args)
+logger.info(args)
+writer = SummaryWriter(args.log)
+
 def main():
     global best_acc
 
-    if not os.path.isdir(args.out):
-        mkdir_p(args.out)
+    # if not os.path.isdir(args.out):
+    #     mkdir_p(args.out)
+
 
     N_SAMPLES_PER_CLASS = make_imb_data(args.num_max, num_class, args.imb_ratio,args.imbalancetype)
     U_SAMPLES_PER_CLASS = make_imb_data(args.num_max_u, num_class, args.imb_ratio_u,args.imbalancetype)
@@ -129,6 +155,7 @@ def main():
 
     # Model
     print("==> creating WRN-28-2")
+    logger.info("==> creating WRN-28-2")
 
     def create_model(ema=False):
         model = models.WRN(2,num_classes=num_class)
@@ -146,6 +173,7 @@ def main():
 
     cudnn.benchmark = True
     print('    Total params: %.2fM' % (sum(p.numel() for p in params) / 1000000.0))
+    logger.info('    Total params: %.2fM' % (sum(p.numel() for p in params) / 1000000.0))
 
     train_criterion = SemiLoss()
     criterion = nn.CrossEntropyLoss()
@@ -158,6 +186,7 @@ def main():
     if args.resume:
         # Load checkpoint.
         print('==> Resuming from checkpoint..')
+        logger.info('==> Resuming from checkpoint..')
         assert os.path.isfile(args.resume), 'Error: no checkpoint directory found!'
         args.out = os.path.dirname(args.resume)
         checkpoint = torch.load(args.resume)
@@ -165,17 +194,27 @@ def main():
         model.load_state_dict(checkpoint['state_dict'])
         ema_model.load_state_dict(checkpoint['ema_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer'])
-        logger = Logger(os.path.join(args.out, 'log.txt'), title=title, resume=True)
+        logger1 = Logger(os.path.join(args.out, 'log.txt'), title=title, resume=True)
     else:
-        logger = Logger(os.path.join(args.out, 'log.txt'), title=title)
-        logger.set_names(['Train Loss', 'Train Loss X', 'Train Loss U', 'Test Loss', 'Test Acc.'])
+        logger1 = Logger(os.path.join(args.out, 'log.txt'), title=title)
+        logger1.set_names(['Train Loss', 'Train Loss X', 'Train Loss U', 'Test Loss', 'Test Acc.'])
+
     for epoch in range(start_epoch, args.epochs):
-        print('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, state['lr']))
+        logger.info('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, state['lr']))
 
 
-        train(labeled_trainloader,unlabeled_trainloader,model, optimizer,ema_optimizer,train_criterion,epoch)
+        losses, losses_x, losses_u = train(labeled_trainloader,unlabeled_trainloader,model, optimizer,ema_optimizer,train_criterion,epoch)
+        print("(",epoch+1,"/",args.epochs,") | Loss:",losses," | Loss_x:", losses_x, " | Loss_u:", losses_u)
+        logger.info('({epoch}/{epochs}) | Loss: {loss:.4f} | Loss_x: {loss_x:.4f} | Loss_u: {loss_u:.4f}'.format(
+            epoch=epoch+1,
+            epochs=args.epochs,
+            loss=losses,
+            loss_x=losses_x,
+            loss_u=losses_u
+        ))
 
-        test_acc1, testclassacc1, test_acc2, testclassacc2= validate(test_loader, ema_model,criterion,mode='Test Stats ')
+
+        loss_test, test_acc1, testclassacc1, test_acc2, testclassacc2= validate(test_loader, ema_model,criterion,mode='Test Stats ')
         GM = 1
         for i in range(num_class):
             if testclassacc1[i] == 0:
@@ -191,7 +230,26 @@ def main():
             else:
                 GM2 *= (testclassacc2[i]) ** (1 / num_class)
 
-        print( "without test debias bACC:",testclassacc1.mean(),"GM:",GM,"with test debias bACC:",testclassacc2.mean(),"GM",GM2)
+        print( "(",epoch+1,"/",args.epochs,") without test debias bACC:",testclassacc1.mean(),"GM:",GM,"with test debias bACC:",testclassacc2.mean(),"GM",GM2)
+        logger.info("({epoch}/{epochs}) | Test_Loss: {loss:.4f} Without test debias bACC: {bACC1:.4f}, GM: {GM1:.4f}, With test debias bACC: {bACC2:.4f}, GM: {GM2:.4f}".format(
+            epoch=epoch+1,
+            epochs=args.epochs,
+            loss=loss_test,
+            bACC1=testclassacc1.mean(),
+            GM1=GM,
+            bACC2=testclassacc2.mean(),
+            GM2=GM2
+        ))
+
+        writer.add_scalar('Train/loss', losses, epoch)
+        writer.add_scalar('Train/loss_x', losses_x, epoch)
+        writer.add_scalar('Train/loss_u', losses_u, epoch)
+        writer.add_scalar('Test/loss', loss_test, epoch)
+        writer.add_scalar('Test/without test debias bACC', testclassacc1.mean(), epoch)
+        writer.add_scalar('Test/Without test debias GM', GM, epoch)
+        writer.add_scalar('Test/With test debias bACC', testclassacc2.mean(), epoch)
+        writer.add_scalar('Test/With test debias GM', GM2, epoch)
+
 
         save_checkpoint({
                 'epoch': epoch + 1,
@@ -201,7 +259,8 @@ def main():
                 'optimizer' : optimizer.state_dict(),
             }, epoch + 1)
 
-    logger.close()
+    writer.close()
+    logger1.close()
 def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimizer, criterion, epoch):
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -338,6 +397,9 @@ def validate(valloader,model,criterion,mode):
             outputs,_=model(inputs)
             outputs2=outputs-biaseddegree
 
+            loss_test = F.cross_entropy(outputs, targets)
+            losses.update(loss_test.item(), inputs.shape[0])
+
             score = F.softmax(outputs)
             score2 = F.softmax(outputs2)
 
@@ -392,7 +454,7 @@ def validate(valloader,model,criterion,mode):
     elif args.dataset=='PatternNet':   # 测试集数量
         accperclass = accperclass/100
         accperclass2 = accperclass2 / 100
-    return (top1.avg, accperclass, top1debias.avg, accperclass2)
+    return (losses.avg, top1.avg, accperclass, top1debias.avg, accperclass2)
 
 
 def f(x, a, b, c, d):
